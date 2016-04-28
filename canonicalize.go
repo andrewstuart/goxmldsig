@@ -55,6 +55,9 @@ func _canonicalHack(el *etree.Element, seenSoFar map[string]bool) *etree.Element
 
 	ne := el.Copy()
 	sort.Sort(attrsByKey(ne.Attr))
+
+	var toRemove []string
+
 	if len(ne.Attr) != 0 {
 		for _, attr := range ne.Attr {
 			if attr.Space != "xmlns" {
@@ -67,6 +70,10 @@ func _canonicalHack(el *etree.Element, seenSoFar map[string]bool) *etree.Element
 				_seenSoFar[key] = true
 			}
 		}
+	}
+
+	for _, k := range toRemove {
+		el.RemoveAttr(k)
 	}
 
 	for i, token := range ne.Child {
