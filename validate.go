@@ -1,6 +1,7 @@
 package dsig
 
 import (
+	"bytes"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
@@ -8,17 +9,16 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"time"
 
 	"github.com/beevik/etree"
 )
 
 var uriRegexp = regexp.MustCompile("^#[a-zA-Z_][\\w.-]*$")
-var wordWrappingRegexp = regexp.MustCompile("[ \t\r\n]+")
 
 type ValidationContext struct {
 	CertificateStore X509CertificateStore
 	IdAttribute      string
+	Clock            *Clock
 }
 
 func NewDefaultValidationContext(certificateStore X509CertificateStore) *ValidationContext {
@@ -68,50 +68,64 @@ func recursivelyRemoveElement(tree, el *etree.Element) bool {
 	return false
 }
 
+// transform applies the passed set of transforms to the specified root element.
+//
+// The functionality of transform is currently very limited and purpose-specific.
+//
 // NOTE(russell_h): Ideally this wouldn't mutate the root passed to it, and would
 // instead return a copy. Unfortunately copying the tree makes it difficult to
 // correctly locate the signature. I'm opting, for now, to simply mutate the root
 // parameter.
-func (ctx *ValidationContext) transform(root, sig *etree.Element, transforms []*etree.Element) (*etree.Element, string, error) {
+func (ctx *ValidationContext) transform(root, sig *etree.Element, transforms []*etree.Element) (*etree.Element, Canonicalizer, error) {
 	if len(transforms) != 2 {
-		return nil, "", errors.New("Expected Enveloped and C14N transforms")
+		return nil, nil, errors.New("Expected Enveloped and C14N transforms")
 	}
 
-	var c14nAlgorithm string
+	var canonicalizer Canonicalizer
 
 	for _, transform := range transforms {
 		algo := transform.SelectAttr(AlgorithmAttr)
 		if algo == nil {
-			return nil, "", errors.New("Missing Algorithm attribute")
+			return nil, nil, errors.New("Missing Algorithm attribute")
 		}
 
-		switch algo.Value {
+		switch AlgorithmID(algo.Value) {
 		case EnvelopedSignatureAltorithmId:
 			if !recursivelyRemoveElement(root, sig) {
-				return nil, "", errors.New("Error applying canonicalization transform: Signature not found")
+				return nil, nil, errors.New("Error applying canonicalization transform: Signature not found")
 			}
-		case string(CanonicalXML10AlgorithmId), string(CanonicalXML11AlgorithmId):
-			c14nAlgorithm = algo.Value
+
+		case CanonicalXML10ExclusiveAlgorithmId:
+			var prefixList string
+			ins := transform.FindElement(childPath("", InclusiveNamespacesTag))
+			if ins != nil {
+				prefixListEl := ins.SelectAttr(PrefixListAttr)
+				if prefixListEl != nil {
+					prefixList = prefixListEl.Value
+				}
+			}
+
+			canonicalizer = MakeC14N10ExclusiveCanonicalizerWithPrefixList(prefixList)
+
+		case CanonicalXML11AlgorithmId:
+			canonicalizer = MakeC14N11Canonicalizer()
+
 		default:
-			return nil, "", errors.New("Unknown Transform Algorithm: " + algo.Value)
+			return nil, nil, errors.New("Unknown Transform Algorithm: " + algo.Value)
 		}
 	}
 
-	if c14nAlgorithm == "" {
-		return nil, "", errors.New("Expected canonicalization transform")
+	if canonicalizer == nil {
+		return nil, nil, errors.New("Expected canonicalization transform")
 	}
 
-	return root, c14nAlgorithm, nil
+	return root, canonicalizer, nil
 }
 
-func (ctx *ValidationContext) digest(el *etree.Element, digestAlgorithmId, c14nAlgorithmId string) ([]byte, error) {
-	doc := etree.NewDocument()
-	doc.SetRoot(canonicalize(el, SignatureAlgorithm(c14nAlgorithmId)))
-
-	doc.WriteSettings = etree.WriteSettings{
-		CanonicalAttrVal: true,
-		CanonicalEndTags: true,
-		CanonicalText:    true,
+func (ctx *ValidationContext) digest(el *etree.Element, digestAlgorithmId string, canonicalizer Canonicalizer) ([]byte, error) {
+	data, err := canonicalizer.Canonicalize(el)
+	if err != nil {
+		return nil, err
 	}
 
 	digestAlgorithm, ok := digestAlgorithmsByIdentifier[digestAlgorithmId]
@@ -120,7 +134,7 @@ func (ctx *ValidationContext) digest(el *etree.Element, digestAlgorithmId, c14nA
 	}
 
 	hash := digestAlgorithm.New()
-	_, err := doc.WriteTo(hash)
+	_, err = hash.Write(data)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +142,7 @@ func (ctx *ValidationContext) digest(el *etree.Element, digestAlgorithmId, c14nA
 	return hash.Sum(nil), nil
 }
 
-func (ctx *ValidationContext) verifySignedInfo(signatureElement *etree.Element, signatureMethodId string, cert *x509.Certificate, sig []byte) error {
+func (ctx *ValidationContext) verifySignedInfo(signatureElement *etree.Element, canonicalizer Canonicalizer, signatureMethodId string, cert *x509.Certificate, sig []byte) error {
 	signedInfo := signatureElement.FindElement(childPath(signatureElement.Space, SignedInfoTag))
 	if signedInfo == nil {
 		return errors.New("Missing SignedInfo")
@@ -140,12 +154,9 @@ func (ctx *ValidationContext) verifySignedInfo(signatureElement *etree.Element, 
 	}
 
 	// Canonicalize the xml
-	doc := etree.NewDocument()
-	doc.SetRoot(canonicalize(signedInfo, SignatureAlgorithm(signatureMethodId)))
-	doc.WriteSettings = etree.WriteSettings{
-		CanonicalAttrVal: true,
-		CanonicalEndTags: true,
-		CanonicalText:    true,
+	canonical, err := canonicalizer.Canonicalize(signedInfo)
+	if err != nil {
+		return err
 	}
 
 	signatureAlgorithm, ok := signatureMethodsByIdentifier[signatureMethodId]
@@ -154,7 +165,7 @@ func (ctx *ValidationContext) verifySignedInfo(signatureElement *etree.Element, 
 	}
 
 	hash := signatureAlgorithm.New()
-	_, err := doc.WriteTo(hash)
+	_, err = hash.Write(canonical)
 	if err != nil {
 		return err
 	}
@@ -225,7 +236,7 @@ func (ctx *ValidationContext) validateSignature(el *etree.Element, cert *x509.Ce
 
 	// Perform all transformations listed in the 'SignedInfo'
 	// Basically, this means removing the 'SignedInfo'
-	transformed, c14nAlgorithmId, err := ctx.transform(referencedElement, sig, transforms.ChildElements())
+	transformed, canonicalizer, err := ctx.transform(referencedElement, sig, transforms.ChildElements())
 	if err != nil {
 		return nil, err
 	}
@@ -246,14 +257,17 @@ func (ctx *ValidationContext) validateSignature(el *etree.Element, cert *x509.Ce
 	}
 
 	// Digest the transformed XML and compare it to the 'DigestValue' from the 'SignedInfo'
-	digest, err := ctx.digest(transformed, digestAlgorithmAttr.Value, c14nAlgorithmId)
+	digest, err := ctx.digest(transformed, digestAlgorithmAttr.Value, canonicalizer)
 	if err != nil {
 		return nil, err
 	}
 
-	// Allow the digest to wrap multiple lines
-	digested := wordWrappingRegexp.ReplaceAllString(digestValue.Text(), "")
-	if digested != base64.StdEncoding.EncodeToString(digest) {
+	decodedDigestValue, err := base64.StdEncoding.DecodeString(digestValue.Text())
+	if err != nil {
+		return nil, err
+	}
+
+	if !bytes.Equal(digest, decodedDigestValue) {
 		return nil, errors.New("Signature could not be verified")
 	}
 
@@ -280,7 +294,7 @@ func (ctx *ValidationContext) validateSignature(el *etree.Element, cert *x509.Ce
 		return nil, errors.New("Could not decode signature")
 	}
 	// Actually verify the 'SignedInfo' was signed by a trusted source
-	err = ctx.verifySignedInfo(sig, signatureMethodAlgorithmAttr.Value, cert, decodedSignature)
+	err = ctx.verifySignedInfo(sig, canonicalizer, signatureMethodAlgorithmAttr.Value, cert, decodedSignature)
 	if err != nil {
 		return nil, err
 	}
@@ -298,7 +312,7 @@ func contains(roots []*x509.Certificate, cert *x509.Certificate) bool {
 }
 
 func (ctx *ValidationContext) verifyCertificate(el *etree.Element) (*x509.Certificate, error) {
-	now := time.Now()
+	now := ctx.Clock.Now()
 	el = el.Copy()
 
 	idAttr := el.SelectAttr(DefaultIdAttr)

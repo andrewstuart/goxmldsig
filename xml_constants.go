@@ -22,24 +22,35 @@ const (
 	KeyInfoTag                = "KeyInfo"
 	X509DataTag               = "X509Data"
 	X509CertificateTag        = "X509Certificate"
+	InclusiveNamespacesTag    = "InclusiveNamespaces"
 )
 
 const (
-	AlgorithmAttr = "Algorithm"
-	URIAttr       = "URI"
-	DefaultIdAttr = "ID"
+	AlgorithmAttr  = "Algorithm"
+	URIAttr        = "URI"
+	DefaultIdAttr  = "ID"
+	PrefixListAttr = "PrefixList"
 )
 
-type SignatureAlgorithm string
+type AlgorithmID string
+
+func (id AlgorithmID) String() string {
+	return string(id)
+}
+
+const (
+	RSASHA1SignatureMethod   = "http://www.w3.org/2000/09/xmldsig#rsa-sha1"
+	RSASHA256SignatureMethod = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
+	RSASHA512SignatureMethod = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512"
+)
 
 //Well-known signature algorithms
 const (
-	// NOTE(russell_h): I guess 1.0 is "exclusive" and 1.1 isn't
-	CanonicalXML10AlgorithmId SignatureAlgorithm = "http://www.w3.org/2001/10/xml-exc-c14n#"
-	CanonicalXML11AlgorithmId                    = "http://www.w3.org/2006/12/xml-c14n11"
-)
-const (
-	EnvelopedSignatureAltorithmId = "http://www.w3.org/2000/09/xmldsig#enveloped-signature"
+	// Supported canonicalization algorithms
+	CanonicalXML10ExclusiveAlgorithmId AlgorithmID = "http://www.w3.org/2001/10/xml-exc-c14n#"
+	CanonicalXML11AlgorithmId          AlgorithmID = "http://www.w3.org/2006/12/xml-c14n11"
+
+	EnvelopedSignatureAltorithmId AlgorithmID = "http://www.w3.org/2000/09/xmldsig#enveloped-signature"
 )
 
 var digestAlgorithmIdentifiers = map[crypto.Hash]string{
@@ -61,7 +72,7 @@ func init() {
 }
 
 var signatureMethodIdentifiers = map[crypto.Hash]string{
-	crypto.SHA1:   "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
-	crypto.SHA256: "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
-	crypto.SHA512: "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512",
+	crypto.SHA1:   RSASHA1SignatureMethod,
+	crypto.SHA256: RSASHA256SignatureMethod,
+	crypto.SHA512: RSASHA512SignatureMethod,
 }

@@ -8,39 +8,48 @@ import (
 	_ "crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 
 	"github.com/beevik/etree"
 )
 
 type SigningContext struct {
-	Hash        crypto.Hash
-	KeyStore    X509KeyStore
-	IdAttribute string
-	Prefix      string
-	Algorithm   SignatureAlgorithm
+	Hash          crypto.Hash
+	KeyStore      X509KeyStore
+	IdAttribute   string
+	Prefix        string
+	Canonicalizer Canonicalizer
 }
 
 func NewDefaultSigningContext(ks X509KeyStore) *SigningContext {
 	return &SigningContext{
-		Hash:        crypto.SHA256,
-		KeyStore:    ks,
-		IdAttribute: DefaultIdAttr,
-		Prefix:      DefaultPrefix,
-		Algorithm:   CanonicalXML11AlgorithmId,
+		Hash:          crypto.SHA256,
+		KeyStore:      ks,
+		IdAttribute:   DefaultIdAttr,
+		Prefix:        DefaultPrefix,
+		Canonicalizer: MakeC14N11Canonicalizer(),
 	}
 }
 
+func (ctx *SigningContext) SetSignatureMethod(algorithmID string) error {
+	hash, ok := signatureMethodsByIdentifier[algorithmID]
+	if !ok {
+		return fmt.Errorf("Unknown SignatureMethod: %s", algorithmID)
+	}
+
+	ctx.Hash = hash
+
+	return nil
+}
+
 func (ctx *SigningContext) digest(el *etree.Element) ([]byte, error) {
-	doc := etree.NewDocument()
-	doc.SetRoot(canonicalize(el, ctx.Algorithm))
-	doc.WriteSettings = etree.WriteSettings{
-		CanonicalAttrVal: true,
-		CanonicalEndTags: true,
-		CanonicalText:    true,
+	canonical, err := ctx.Canonicalizer.Canonicalize(el)
+	if err != nil {
+		return nil, err
 	}
 
 	hash := ctx.Hash.New()
-	_, err := doc.WriteTo(hash)
+	_, err = hash.Write(canonical)
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +80,7 @@ func (ctx *SigningContext) constructSignedInfo(el *etree.Element, enveloped bool
 
 	// /SignedInfo/CanonicalizationMethod
 	canonicalizationMethod := ctx.createNamespacedElement(signedInfo, CanonicalizationMethodTag)
-	canonicalizationMethod.CreateAttr(AlgorithmAttr, string(ctx.Algorithm))
+	canonicalizationMethod.CreateAttr(AlgorithmAttr, string(ctx.Canonicalizer.Algorithm()))
 
 	// /SignedInfo/SignatureMethod
 	signatureMethod := ctx.createNamespacedElement(signedInfo, SignatureMethodTag)
@@ -91,10 +100,10 @@ func (ctx *SigningContext) constructSignedInfo(el *etree.Element, enveloped bool
 	transforms := ctx.createNamespacedElement(reference, TransformsTag)
 	if enveloped {
 		envelopedTransform := ctx.createNamespacedElement(transforms, TransformTag)
-		envelopedTransform.CreateAttr(AlgorithmAttr, EnvelopedSignatureAltorithmId)
+		envelopedTransform.CreateAttr(AlgorithmAttr, EnvelopedSignatureAltorithmId.String())
 	}
 	canonicalizationAlgorithm := ctx.createNamespacedElement(transforms, TransformTag)
-	canonicalizationAlgorithm.CreateAttr(AlgorithmAttr, string(ctx.Algorithm))
+	canonicalizationAlgorithm.CreateAttr(AlgorithmAttr, string(ctx.Canonicalizer.Algorithm()))
 
 	// /SignedInfo/Reference/DigestMethod
 	digestMethod := ctx.createNamespacedElement(reference, DigestMethodTag)

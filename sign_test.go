@@ -21,14 +21,10 @@ func TestSign(t *testing.T) {
 	id := "_" + uuid.NewV4().String()
 	authnRequest.CreateAttr("ID", id)
 	hash := crypto.SHA256.New()
-	doc := etree.NewDocument()
-	doc.SetRoot(canonicalHack(authnRequest))
-	doc.WriteSettings = etree.WriteSettings{
-		CanonicalAttrVal: true,
-		CanonicalEndTags: true,
-		CanonicalText:    true,
-	}
-	_, err := doc.WriteTo(hash)
+	canonicalized, err := ctx.Canonicalizer.Canonicalize(authnRequest)
+	require.NoError(t, err)
+
+	_, err = hash.Write(canonicalized)
 	require.NoError(t, err)
 	digest := hash.Sum(nil)
 
@@ -47,7 +43,7 @@ func TestSign(t *testing.T) {
 
 	canonicalizationMethodAttr := canonicalizationMethodElement.SelectAttr(AlgorithmAttr)
 	require.NotEmpty(t, canonicalizationMethodAttr)
-	require.Equal(t, CanonicalXML11AlgorithmId, canonicalizationMethodAttr.Value)
+	require.Equal(t, CanonicalXML11AlgorithmId.String(), canonicalizationMethodAttr.Value)
 
 	signatureMethodElement := signedInfo.FindElement("//" + SignatureMethodTag)
 	require.NotEmpty(t, signatureMethodElement)
@@ -71,7 +67,7 @@ func TestSign(t *testing.T) {
 
 	algorithmAttr := transformElement.SelectAttr(AlgorithmAttr)
 	require.NotEmpty(t, algorithmAttr)
-	require.Equal(t, EnvelopedSignatureAltorithmId, algorithmAttr.Value)
+	require.Equal(t, EnvelopedSignatureAltorithmId.String(), algorithmAttr.Value)
 
 	digestMethodElement := referenceElement.FindElement("//" + DigestMethodTag)
 	require.NotEmpty(t, digestMethodElement)
@@ -103,12 +99,7 @@ func TestSignErrors(t *testing.T) {
 	require.Error(t, err)
 
 	randomKeyStore = RandomKeyStoreForTest()
-	ctx = &SigningContext{
-		Hash:        crypto.SHA256,
-		KeyStore:    randomKeyStore,
-		IdAttribute: DefaultIdAttr,
-		Prefix:      DefaultPrefix,
-	}
+	ctx = NewDefaultSigningContext(randomKeyStore)
 
 	authnRequest = &etree.Element{
 		Space: "samlp",
